@@ -332,6 +332,7 @@ const TRACK_BINDINGS = {
     // Track rows
     for (let i = 0; i < SEQ_DATA.tracks.length; i++) {
       const tr = SEQ_DATA.tracks[i];
+      if (tr.id.endsWith("_hhc") || tr.id.endsWith("_hho")) continue;
       const idxNum = i + 1;
   
       const bind = TRACK_BINDINGS[tr.id] || "(unbound)";
@@ -345,14 +346,8 @@ const TRACK_BINDINGS = {
         extra = `  held=${fmtBool(st.isHeld)}  heldUntil=${st.heldUntilStep}`;
       }
   
-      const hatTag = tr.id.endsWith("_hhc")
-        ? " hh=closed"
-        : tr.id.endsWith("_hho")
-        ? " hh=open"
-        : "";
-  
       text(
-        `${idxNum}:${tr.id} "${tr.name}"  chan=${tr.channel}  instr=${bind}${hatTag}  mute=${fmtBool(tr.mute)}  stepPos=${st.stepPos}/${len}${extra}`,
+        `${idxNum}:${tr.id} "${tr.name}"  chan=${tr.channel}  instr=${bind}  mute=${fmtBool(tr.mute)}  stepPos=${st.stepPos}/${len}${extra}`,
         18,
         y
       );
