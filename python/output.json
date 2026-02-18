@@ -1,4 +1,4 @@
-const SEQ_DATA  = {
+{
   "version": 1,
   "transport": {
     "bpm": 104.00001386666851,

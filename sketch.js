@@ -1,8 +1,8 @@
 const TRACK_BINDINGS = {
-    t1: "pluck",
+    t1: "bright",
     t2: "bright",
     t3: "softPad",
-    t4: "kick",
+    t4: "pluck",
     // drum tracks are added dynamically in setup()
   };
   
@@ -24,7 +24,7 @@ const TRACK_BINDINGS = {
       decay: 0.15,
       sustain: 0.0,
       release: 0.05,
-      gain: 2.5,
+      gain: 2,
     },
   
     snare: {
@@ -46,7 +46,7 @@ const TRACK_BINDINGS = {
       sustain: 0.0,
       release: 0.02,
       gain: 0.35,
-      baseFreq: 8000,
+      baseFreq: 800,
     },
   
     hihatOpen: {
@@ -104,6 +104,13 @@ const TRACK_BINDINGS = {
     44: "hihat_pedal",
     46: "hihat_open",
   };
+
+// ==============================
+// 2.5) LOOP RANGE (edit these)
+// ==============================
+// Inclusive step range for playback loop. Use null for "end of song".
+const LOOP_START_STEP = 60;
+const LOOP_END_STEP = 510;
   
   // ==============================
   // 3) STATE
@@ -113,13 +120,18 @@ const TRACK_BINDINGS = {
     return b ? "ON" : "off";
   }
   
-  let instrumentPools = {};
-  let trackState = {};
-  let stepMs = 0;
-  let globalStep = 0;
-  let masterClockRunning = false;
+let instrumentPools = {};
+let trackState = {};
+let stepMs = 0;
+let globalStep = 0;
+let masterClockRunning = false;
+let loopStartStep = 0;
+let loopEndStep = 0;
+let lastTickTime = 0;
+let arcSegmentsByTrack = {};
+let hasStarted = false;
   
-  let masterPan; // p5.Panner3D
+  
   
   // ==============================
   // 4) UTILS
@@ -220,18 +232,75 @@ const TRACK_BINDINGS = {
   
     SEQ_DATA.tracks = rebuilt;
   }
+
+function getMaxPatternLength() {
+  let maxLen = 1;
+  for (const tr of SEQ_DATA.tracks) {
+    const len = tr.pattern?.lengthSteps || tr.pattern?.steps?.length || 1;
+    if (len > maxLen) maxLen = len;
+  }
+  return maxLen;
+}
+
+function clampLoopRange(maxLen) {
+  const start = Math.max(0, Math.min(LOOP_START_STEP, maxLen - 1));
+  const end =
+    LOOP_END_STEP == null
+      ? maxLen - 1
+      : Math.max(start, Math.min(LOOP_END_STEP, maxLen - 1));
+  return { start, end };
+}
+
+function getLoopLength() {
+  return Math.max(1, loopEndStep - loopStartStep + 1);
+}
+
+function stepToAngle(step, progress = 0) {
+  const loopLen = getLoopLength();
+  const idx = (step - loopStartStep + loopLen) % loopLen;
+  const pct = (idx + progress) / loopLen;
+  return pct * TWO_PI - HALF_PI;
+}
+
+function getTrackRadius(trackIndex, totalTracks, maxRadius) {
+  if (totalTracks <= 1) return maxRadius;
+  const step = maxRadius / (totalTracks - 1);
+  return maxRadius - trackIndex * step;
+}
+
+const PITCH_MIN = 36;
+const PITCH_MAX = 96;
+const NOTE_OFFSET_RANGE = 2;
+
+function getNoteOffsetNorm(ev) {
+  if (ev?.note != null) return 0;
+  if (typeof ev?.pitch !== "number") return 0;
+  const t = clamp01((ev.pitch - PITCH_MIN) / (PITCH_MAX - PITCH_MIN));
+  return (t * 2 - 1) * NOTE_OFFSET_RANGE;
+}
+
+function addArcSegment(trackId, durationSteps, noteOffsetNorm) {
+  const loopLen = getLoopLength();
+  const span = Math.min(durationSteps, loopLen) / loopLen * TWO_PI;
+  const startAngle = stepToAngle(globalStep, 0);
+  const endAngle = startAngle + span;
+  if (!arcSegmentsByTrack[trackId]) arcSegmentsByTrack[trackId] = [];
+  arcSegmentsByTrack[trackId].push({ startAngle, endAngle, noteOffsetNorm });
+  if (arcSegmentsByTrack[trackId].length > 3000) {
+    arcSegmentsByTrack[trackId].shift();
+  }
+}
   
   // ==============================
   // 5) SETUP
   // ==============================
   
   function setup() {
-    createCanvas(850, 420);
+  createCanvas(windowWidth, windowHeight);
+  pixelDensity(1);
     textFont("monospace");
-    noStroke();
-  
-    masterPan = new p5.Panner3D();
-    masterPan.connect();
+  colorMode(HSB, 360, 100, 100, 100);
+  noFill();
   
     for (const id in INSTRUMENTS) {
       const cfg = INSTRUMENTS[id];
@@ -239,7 +308,7 @@ const TRACK_BINDINGS = {
       const gainNode = new p5.Gain();
       gainNode.amp(cfg.gain);
       gainNode.disconnect();
-      gainNode.connect(masterPan);
+      gainNode.connect();
   
       const pool = {
         params: cfg,
@@ -269,9 +338,16 @@ const TRACK_BINDINGS = {
     }
   
     splitDrumTracks();
+
+  const loopRange = clampLoopRange(getMaxPatternLength());
+  loopStartStep = loopRange.start;
+  loopEndStep = loopRange.end;
+  globalStep = loopStartStep;
+  lastTickTime = millis();
   
     for (const tr of SEQ_DATA.tracks) {
       trackState[tr.id] = { stepPos: 0, heldUntilStep: -1, isHeld: false };
+    arcSegmentsByTrack[tr.id] = [];
     }
   
     const { bpm, stepsPerBeat } = SEQ_DATA.transport;
@@ -279,108 +355,110 @@ const TRACK_BINDINGS = {
   
     setInterval(tick, stepMs);
   }
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+  
+  function stopMasterClock() {
+    masterClockRunning = false;
+  
+    for (const tr of SEQ_DATA.tracks) {
+      const instrId = TRACK_BINDINGS[tr.id];
+      if (instrId === "pluck") {
+        const st = trackState[tr.id];
+        st.isHeld = false;
+        st.heldUntilStep = -1;
+        const pool = instrumentPools[instrId];
+        if (pool?.monoVoice) pool.monoVoice.env.triggerRelease();
+      }
+    }
+  }
+  
+  function toggleMasterClock() {
+    if (masterClockRunning) {
+      stopMasterClock();
+    } else {
+      masterClockRunning = true;
+    if (!hasStarted) hasStarted = true;
+    }
+  }
   
   function mousePressed() {
     userStartAudio();
+    toggleMasterClock();
+  }
+  
+  function touchStarted() {
+    userStartAudio();
+    toggleMasterClock();
+    return false;
   }
   
   // ==============================
-  // 6) DRAW + PAN CONTROL
+  // 6) DRAW
   // ==============================
   
   function draw() {
-    background(0);
-    fill("lime");
-    textSize(14);
-  
-    // mouseX (0..width) -> pan (-1..+1)
-    const panVal = map(constrain(mouseX, 0, width), 0, width, -1, 1);
-    // p5.Panner3D uses .set(x,y,z) (NOT setPosition)
-    if (masterPan) masterPan.set(panVal, 0, 0.5);
-  
-    let y = 24;
-  
-    text("Step Sequencer (JSON patterns + external instruments)", 18, y);
-    y += 18;
-  
-    const t = SEQ_DATA.transport;
-    text(
-      `BPM=${t.bpm}  stepsPerBeat=${t.stepsPerBeat}  stepMs=${stepMs.toFixed(1)}`,
-      18,
-      y
-    );
-    y += 18;
+  background(240);
 
-    const instrNames = Object.keys(INSTRUMENTS).join(", ");
-    text(`Instruments: ${instrNames}`, 18, y);
-    y += 18;
+  const cx = width / 2;
+  const cy = height / 2;
+  const maxRadius = Math.min(width, height) * 0.4;
+  const totalTracks = SEQ_DATA.tracks.length;
+  const trackSpacing = totalTracks > 1 ? maxRadius / (totalTracks - 1) : 0;
+
+  const now = millis();
+  const stepProgress = masterClockRunning
+    ? clamp01((now - lastTickTime) / stepMs)
+    : 0;
+  const angle = stepToAngle(globalStep, stepProgress);
+
+
+  // Draw accumulated note arcs
   
-    text(
-      `GLOBAL STEP: ${globalStep}  [${masterClockRunning ? "RUNNING" : "STOPPED"}]`,
-      18,
-      y
-    );
-    y += 18;
-  
-    text("Click to enable audio | M start/stop | 1..9 mute | mouseX pan", 18, y);
-    y += 24;
-  
-    // Track table header
-    text("Tracks:", 18, y);
-    y += 18;
-  
-    // Track rows
-    for (let i = 0; i < SEQ_DATA.tracks.length; i++) {
-      const tr = SEQ_DATA.tracks[i];
-      if (tr.id.endsWith("_hhc") || tr.id.endsWith("_hho")) continue;
-      const idxNum = i + 1;
-  
-      const bind = TRACK_BINDINGS[tr.id] || "(unbound)";
-      const st = trackState[tr.id] || { stepPos: 0, heldUntilStep: -1, isHeld: false };
-      const pat = tr.pattern || {};
-      const len = pat.lengthSteps || (pat.steps ? pat.steps.length : 0);
-  
-      // pluck-specific extra debug
-      let extra = "";
-      if (bind === "pluck") {
-        extra = `  held=${fmtBool(st.isHeld)}  heldUntil=${st.heldUntilStep}`;
+  for (let i = 0; i < totalTracks; i++) {
+    const tr = SEQ_DATA.tracks[i];
+    const baseR = getTrackRadius(i, totalTracks, maxRadius);
+    const hueMin = 0;
+    const hueMax = 60;
+    const t = totalTracks <= 1 ? 0 : i / (totalTracks - 1);
+    const hue = hueMin + t * (hueMax - hueMin);
+    stroke(hue, 80, 100, 80);
+    strokeWeight(maxRadius/totalTracks);
+    const segments = arcSegmentsByTrack[tr.id] || [];
+    for (const seg of segments) {
+      const r = Math.max(2, baseR + (seg.noteOffsetNorm ?? 0) * trackSpacing);
+      const startNorm = (seg.startAngle % TWO_PI + TWO_PI) % TWO_PI;
+      const endNormRaw = seg.endAngle - seg.startAngle;
+      if (endNormRaw >= TWO_PI) {
+        arc(cx, cy, r * 2, r * 2, 0, TWO_PI);
+        continue;
       }
-  
-      text(
-        `${idxNum}:${tr.id} "${tr.name}"  chan=${tr.channel}  instr=${bind}  mute=${fmtBool(tr.mute)}  stepPos=${st.stepPos}/${len}${extra}`,
-        18,
-        y
-      );
-      y += 18;
-  
-      // Show a compact view of current step events (optional but useful)
-      const stepsArr = pat.steps || [];
-      const localStep = (st.stepPos || 0) % (len || 1);
-      const evs = stepsArr[localStep] || [];
-  
-      // Print current step events (trim if too many)
-      const evText =
-        evs.length === 0
-          ? "[]"
-          : "[" +
-            evs
-              .slice(0, 3)
-              .map((e) => {
-                if (e.note) {
-                  return `${e.note} v=${(e.velocity ?? 1).toFixed(2)} d=${e.duration ?? 1}`;
-                }
-                return `p=${e.pitch} v=${(e.velocity ?? 1).toFixed(2)} d=${e.duration ?? 1}`;
-              })
-              .join(" | ") +
-            (evs.length > 3 ? " | ..." : "") +
-            "]";
-  
-      text(`    step=${localStep} events=${evText}`, 18, y);
-      y += 18;
+      const endNorm = startNorm + endNormRaw;
+      if (endNorm <= TWO_PI) {
+        arc(cx, cy, r * 2, r * 2, startNorm, endNorm, CHORD);
+      } else {
+        // arc(cx, cy, r * 2, r * 2, startNorm, TWO_PI);
+        // arc(cx, cy, r * 2, r * 2, 0, endNorm - TWO_PI);
+      }
     }
-  
-    y += 10;
-    text(`Master pan: ${panVal.toFixed(2)} (mouseX)`, 18, y);
+  }
+
+  // Rotating radial line with points
+  stroke(100, 100, 0, 60);
+  strokeWeight(2);
+  const x2 = cx + Math.cos(angle) * maxRadius;
+  const y2 = cy + Math.sin(angle) * maxRadius;
+  line(cx, cy, x2, y2);
+
+  if (!hasStarted) {
+    noStroke();
+    fill(0, 0, 0, 70);
+    textAlign(CENTER, TOP);
+    textSize(Math.max(14, maxRadius * 0.06));
+    text("tap to start", cx, cy + Math.max(16, maxRadius * 0.2));
+  }
   }
   
   
@@ -393,28 +471,13 @@ const TRACK_BINDINGS = {
   
     if (k >= "1" && k <= "9") toggleTrackMuteByNumber(+k);
   
-    if (k === "M") {
-      masterClockRunning = !masterClockRunning;
-  
-      // When stopping, release held pluck so it doesn't hang
-      if (!masterClockRunning) {
-        for (const tr of SEQ_DATA.tracks) {
-          const instrId = TRACK_BINDINGS[tr.id];
-          if (instrId === "pluck") {
-            const st = trackState[tr.id];
-            st.isHeld = false;
-            st.heldUntilStep = -1;
-            const pool = instrumentPools[instrId];
-            if (pool?.monoVoice) pool.monoVoice.env.triggerRelease();
-          }
-        }
-      }
-    }
+    if (k === "M") toggleMasterClock();
   }
   
   
   function tick() {
     if (!masterClockRunning) return;
+  lastTickTime = millis();
   
     // 1) Release pluck notes whose duration ended (even if muted)
     for (const tr of SEQ_DATA.tracks) {
@@ -429,13 +492,13 @@ const TRACK_BINDINGS = {
       }
     }
   
-    // 2) Process ALL tracks for timing (advance stepPos no matter what)
+  // 2) Process ALL tracks for timing (globalStep drives each track)
     for (const tr of SEQ_DATA.tracks) {
       const st = trackState[tr.id];
       const pat = tr.pattern;
   
       // Determine local step for THIS tick (before increment)
-      const stepIdx = st.stepPos;
+    const stepIdx = (globalStep % pat.lengthSteps + pat.lengthSteps) % pat.lengthSteps;
       const events = (pat.steps && pat.steps[stepIdx]) ? pat.steps[stepIdx] : [];
   
       // If muted: don't trigger, but keep time.
@@ -448,16 +511,20 @@ const TRACK_BINDINGS = {
           st.heldUntilStep = -1;
         }
       } else {
-        // Not muted → trigger events
-        for (const ev of events) triggerEvent(tr.id, ev);
+    // Not muted → trigger events
+    for (const ev of events) triggerEvent(tr.id, ev);
       }
   
-      // Always advance step position to stay in sync with master
-      st.stepPos = (st.stepPos + 1) % pat.lengthSteps;
+    // Keep per-track state in sync for display/debug
+    st.stepPos = stepIdx;
     }
   
     // 3) Advance global step
+  if (globalStep >= loopEndStep) {
+    globalStep = loopStartStep;
+  } else {
     globalStep++;
+  }
   }
   
   
@@ -473,6 +540,8 @@ const TRACK_BINDINGS = {
   
     const vel = clamp01(ev.velocity ?? 1);
     const durSteps = Math.max(1, ev.duration ?? 1);
+
+  addArcSegment(trackId, durSteps, getNoteOffsetNorm(ev));
   
     if (instrId === "pluck") {
       const v = pool.monoVoice;

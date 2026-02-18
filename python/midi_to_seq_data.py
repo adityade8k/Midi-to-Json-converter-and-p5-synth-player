@@ -41,6 +41,7 @@ Usage:
 import argparse
 import json
 import math
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -193,6 +194,24 @@ def collect_note_spans_by_channel(mid: mido.MidiFile) -> Dict[int, List[NoteSpan
     return by_ch
 
 
+def collect_channel_names(mid: mido.MidiFile) -> Dict[int, str]:
+    """
+    Try to map MIDI channels to human-readable names using track_name meta.
+    If a channel appears in multiple tracks, keep the first name found.
+    """
+    names: Dict[int, str] = {}
+    for track in mid.tracks:
+        track_name = None
+        for msg in track:
+            if msg.type == "track_name":
+                track_name = msg.name.strip() if msg.name else None
+            elif hasattr(msg, "channel"):
+                ch = int(msg.channel)
+                if ch not in names and track_name:
+                    names[ch] = track_name
+    return names
+
+
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
@@ -262,6 +281,8 @@ def convert_midi_to_seq_json(
     steps_per_beat: int = 4,
     beats_per_bar_override: Optional[int] = None,
     drum_mode: str = "gm_labels",
+    include_channels: Optional[List[int]] = None,
+    interactive_select: bool = False,
 ) -> Dict[str, Any]:
     mid = mido.MidiFile(midi_path)
 
@@ -282,6 +303,24 @@ def convert_midi_to_seq_json(
     bars = max(1, int(math.ceil(total_steps / steps_per_bar)))
 
     by_ch = collect_note_spans_by_channel(mid)
+    ch_names = collect_channel_names(mid)
+
+    if include_channels is None and interactive_select:
+        print("Available tracks (grouped by MIDI channel):")
+        for ch in sorted(by_ch.keys()):
+            name = ch_names.get(ch) or ("Drums" if ch == 9 else f"Channel {ch}")
+            note_count = len(by_ch[ch])
+            print(f"  {ch}: {name} ({note_count} notes)")
+        raw = input("Choose channels to include (comma list, Enter=all): ").strip()
+        if raw:
+            try:
+                include_channels = [int(s) for s in raw.split(",") if s.strip() != ""]
+            except ValueError:
+                raise ValueError("Invalid channel list. Use comma-separated integers like 0,2,9.")
+
+    if include_channels is not None:
+        include_set = set(include_channels)
+        by_ch = {ch: spans for ch, spans in by_ch.items() if ch in include_set}
 
     # Build tracks with ids t1, t2, t3... so you can bind externally like your sketch
     tracks_out: List[Dict[str, Any]] = []
@@ -301,7 +340,7 @@ def convert_midi_to_seq_json(
 
         track = {
             "id": f"t{track_index}",
-            "name": "Drums" if ch == 9 else f"Channel {ch}",
+            "name": ch_names.get(ch) or ("Drums" if ch == 9 else f"Channel {ch}"),
             "channel": int(ch),
             "mute": False,
             "solo": False,
@@ -341,6 +380,17 @@ def main():
     ap.add_argument("--steps-per-beat", type=int, default=4)
     ap.add_argument("--beats-per-bar", type=int, default=None)
     ap.add_argument(
+        "--channels",
+        type=str,
+        default=None,
+        help="Comma-separated MIDI channel numbers to include (e.g. 0,2,9).",
+    )
+    ap.add_argument(
+        "--interactive-select",
+        action="store_true",
+        help="List channels and prompt to select (default when running in a TTY and --channels not provided).",
+    )
+    ap.add_argument(
         "--drum-mode",
         choices=["kick_only", "gm_labels"],
         default="gm_labels",
@@ -348,11 +398,22 @@ def main():
     )
     args = ap.parse_args()
 
+    include_channels = None
+    if args.channels:
+        try:
+            include_channels = [int(s) for s in args.channels.split(",") if s.strip() != ""]
+        except ValueError:
+            raise ValueError("Invalid --channels list. Use comma-separated integers like 0,2,9.")
+
+    interactive_select = args.interactive_select or (include_channels is None and sys.stdin.isatty())
+
     data = convert_midi_to_seq_json(
         args.input_midi,
         steps_per_beat=args.steps_per_beat,
         beats_per_bar_override=args.beats_per_bar,
         drum_mode=args.drum_mode,
+        include_channels=include_channels,
+        interactive_select=interactive_select,
     )
 
     with open(args.output_json, "w", encoding="utf-8") as f:
